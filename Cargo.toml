@@ -1,6 +1,6 @@
 [package]
 name = "tile-group"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "A lightweight, opt-in window group tiler for Windows"
 license = "MIT"
@@ -14,7 +14,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_Graphics_Gdi",
     "Win32_UI_Accessibility",
     "Win32_UI_HiDpi",
+    "Win32_UI_Shell",
     "Win32_System_Console",
+    "Win32_System_LibraryLoader",
 ] }
 
 # 磁盘与体积优化配置：减少 PDB 调试符号体积，Release 模式下极致压缩

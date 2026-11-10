@@ -1,42 +1,63 @@
+#![cfg_attr(not(test), windows_subsystem = "windows")]
+
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::env;
 use std::mem::{size_of, zeroed};
 use std::ptr::null_mut;
+use std::time::{Duration, Instant};
 
-use windows_sys::Win32::Foundation::{HWND, POINT, RECT, S_OK};
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, S_OK, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
 use windows_sys::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromPoint, MonitorFromWindow, HMONITOR, MONITORINFO,
     MONITOR_DEFAULTTONEAREST,
 };
 use windows_sys::Win32::System::Console::{
-    GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_EXTENDED_FLAGS, ENABLE_QUICK_EDIT_MODE,
-    STD_INPUT_HANDLE,
+    AllocConsole, FreeConsole, GetConsoleMode, GetStdHandle, SetConsoleMode,
+    ENABLE_EXTENDED_FLAGS, ENABLE_QUICK_EDIT_MODE, STD_INPUT_HANDLE,
 };
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows_sys::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    RegisterHotKey, UnregisterHotKey, MOD_ALT, MOD_NOREPEAT,
+    keybd_event, RegisterHotKey, UnregisterHotKey, KEYEVENTF_KEYUP, MOD_ALT, MOD_NOREPEAT,
+};
+use windows_sys::Win32::UI::Shell::{
+    Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
+    NIM_MODIFY, NOTIFYICONDATAW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     DispatchMessageW, GetCursorPos, GetForegroundWindow, GetMessageW, GetShellWindow,
-    GetWindowLongW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IsIconic, IsWindow,
-    IsWindowVisible, IsZoomed, PostQuitMessage, SendMessageTimeoutW, SetForegroundWindow,
-    SetWindowPos, ShowWindow, TranslateMessage, EVENT_OBJECT_DESTROY, GWL_EXSTYLE, GWL_STYLE,
-    HWND_TOP, MSG, OBJID_WINDOW, SC_RESTORE, SMTO_ABORTIFHUNG, SWP_NOACTIVATE, SWP_NOZORDER,
-    SW_MINIMIZE, SW_RESTORE, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_HOTKEY,
-    WM_SYSCOMMAND, WS_EX_TOOLWINDOW, WS_THICKFRAME,
+    GetWindowLongW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed, KillTimer, LoadIconW,
+    PostQuitMessage, RegisterClassW, SendMessageTimeoutW, SetForegroundWindow, SetTimer,
+    SetWindowPos, ShowWindow, ShowWindowAsync, TrackPopupMenu, TranslateMessage,
+    EVENT_OBJECT_DESTROY, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
+    EVENT_SYSTEM_MINIMIZESTART, GWL_EXSTYLE, GWL_STYLE, HWND_NOTOPMOST, HWND_TOPMOST,
+    IDI_APPLICATION, MF_SEPARATOR, MF_STRING, MSG, OBJID_WINDOW, SC_RESTORE, SMTO_ABORTIFHUNG,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_MINIMIZE, SW_RESTORE,
+    SW_SHOWNOACTIVATE, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, WINEVENT_OUTOFCONTEXT,
+    WINEVENT_SKIPOWNPROCESS, WM_COMMAND, WM_DESTROY, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_RBUTTONUP,
+    WM_SYSCOMMAND, WM_TIMER, WM_USER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW,
+    WS_THICKFRAME,
 };
 
 #[link(name = "kernel32")]
 extern "system" {
     fn GetUserDefaultUILanguage() -> u16;
+    fn GetCurrentThreadId() -> u32;
 }
 
-// Hotkey IDs / 快捷键 ID 定义
+#[link(name = "user32")]
+extern "system" {
+    fn AttachThreadInput(id_attach: u32, id_attach_to: u32, f_attach: i32) -> i32;
+}
+
+// Hotkey IDs / 快捷键 ID
 const HK_TOGGLE_WINDOW: i32 = 1; // Alt + G: Add / Remove current window & auto-tile
 const HK_MIN_RESTORE: i32 = 2;   // Alt + H: Hide (Minimize) / Restore entire group
 const HK_CYCLE_REGION: i32 = 3;  // Alt + S: Cycle tiling region
@@ -44,6 +65,20 @@ const HK_RETILE: i32 = 4;        // Alt + T: Manually re-tile current group
 const HK_CLEAR_GROUP: i32 = 5;   // Alt + C: Clear window group
 const HK_QUIT: i32 = 6;          // Alt + Q: Quit program
 const HK_TOGGLE_LANG: i32 = 7;   // Alt + L: Switch UI language (EN / ZH)
+
+// System Tray & Timer constants
+const WM_TRAYICON: u32 = WM_USER + 1;
+const TRAY_ICON_ID: u32 = 1;
+const TIMER_STATE_POLL: usize = 100;
+
+// Tray Menu Command IDs
+const CMD_RETILE: usize = 1001;
+const CMD_MIN_RESTORE: usize = 1002;
+const CMD_CYCLE_REGION: usize = 1003;
+const CMD_CLEAR_GROUP: usize = 1004;
+const CMD_TOGGLE_CONSOLE: usize = 1005;
+const CMD_TOGGLE_LANG: usize = 1006;
+const CMD_QUIT: usize = 1007;
 
 /// UI Language / 界面语言
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,7 +96,6 @@ impl Lang {
                 _ => {}
             }
         }
-        // If the executable name ends with "-en" or "_en" (e.g. tile-group-en.exe), default to English
         if let Ok(exe_path) = env::current_exe() {
             if let Some(stem) = exe_path.file_stem().and_then(|s| s.to_str()) {
                 let lower = stem.to_ascii_lowercase();
@@ -73,7 +107,6 @@ impl Lang {
                 }
             }
         }
-        // Auto-detect via Windows UI Language (0x04 = LANG_CHINESE)
         let lang_id = unsafe { GetUserDefaultUILanguage() };
         if (lang_id & 0x3ff) == 0x04 {
             Lang::Zh
@@ -126,7 +159,6 @@ impl TileRegion {
         }
     }
 
-    /// Crop work area rectangle according to target region mode
     fn apply(self, work_area: RECT) -> RECT {
         let w = work_area.right - work_area.left;
         let h = work_area.bottom - work_area.top;
@@ -164,9 +196,16 @@ impl TileRegion {
 struct GroupManager {
     windows: Vec<HWND>,
     original_rects: HashMap<HWND, RECT>,
+    /// Tracks previous `IsIconic` state of each grouped window to detect minimize/restore transitions reliably
+    last_iconic: HashMap<HWND, bool>,
+    /// Tracks whether the active foreground window was inside the group on the last tick
+    last_fg_in_group: bool,
     region: TileRegion,
     target_monitor: Option<HMONITOR>,
     lang: Lang,
+    suppress_sync_until: Option<Instant>,
+    console_allocated: bool,
+    msg_hwnd: HWND,
 }
 
 impl GroupManager {
@@ -174,16 +213,81 @@ impl GroupManager {
         Self {
             windows: Vec::new(),
             original_rects: HashMap::new(),
+            last_iconic: HashMap::new(),
+            last_fg_in_group: false,
             region: TileRegion::FullWorkArea,
             target_monitor: None,
             lang,
+            suppress_sync_until: None,
+            console_allocated: false,
+            msg_hwnd: null_mut(),
         }
+    }
+
+    fn mark_sync_cooldown(&mut self) {
+        self.suppress_sync_until = Some(Instant::now() + Duration::from_millis(500));
+    }
+
+    fn is_in_sync_cooldown(&self) -> bool {
+        self.suppress_sync_until
+            .map(|until| Instant::now() < until)
+            .unwrap_or(false)
+    }
+
+    fn sync_iconic_snapshot(&mut self) {
+        self.last_iconic.clear();
+        for &hwnd in &self.windows {
+            let iconic = unsafe { IsIconic(hwnd) != 0 };
+            self.last_iconic.insert(hwnd, iconic);
+        }
+        let fg = unsafe { GetForegroundWindow() };
+        self.last_fg_in_group = !fg.is_null() && self.windows.contains(&fg);
     }
 
     fn toggle_language(&mut self) {
         self.lang = self.lang.toggle();
         print_banner(self.lang);
         self.print_group_status();
+        self.update_tray_tooltip();
+    }
+
+    fn toggle_console(&mut self) {
+        unsafe {
+            if self.console_allocated {
+                FreeConsole();
+                self.console_allocated = false;
+            } else if AllocConsole() != 0 {
+                self.console_allocated = true;
+                disable_console_quick_edit();
+                print_banner(self.lang);
+                self.print_group_status();
+            }
+        }
+    }
+
+    fn update_tray_tooltip(&self) {
+        if self.msg_hwnd.is_null() {
+            return;
+        }
+        let tip = match self.lang {
+            Lang::Zh => format!(
+                "TileGroup - 当前组内 {} 个窗口 (右键打开菜单)",
+                self.windows.len()
+            ),
+            Lang::En => format!(
+                "TileGroup - {} window(s) in group (Right-click for menu)",
+                self.windows.len()
+            ),
+        };
+        unsafe {
+            let mut nid: NOTIFYICONDATAW = zeroed();
+            nid.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+            nid.hWnd = self.msg_hwnd;
+            nid.uID = TRAY_ICON_ID;
+            nid.uFlags = NIF_TIP;
+            copy_wide_str(&mut nid.szTip, &tip);
+            Shell_NotifyIconW(NIM_MODIFY, &nid);
+        }
     }
 
     /// Prune closed or invalid window handles
@@ -192,10 +296,16 @@ impl GroupManager {
         self.windows.retain(|&hwnd| unsafe { IsWindow(hwnd) != 0 });
         self.original_rects
             .retain(|&hwnd, _| unsafe { IsWindow(hwnd) != 0 });
+        self.last_iconic
+            .retain(|&hwnd, _| unsafe { IsWindow(hwnd) != 0 });
         if self.windows.is_empty() {
             self.target_monitor = None;
         }
-        self.windows.len() != before
+        let changed = self.windows.len() != before;
+        if changed {
+            self.update_tray_tooltip();
+        }
+        changed
     }
 
     /// Add or remove the current foreground window
@@ -214,12 +324,13 @@ impl GroupManager {
         let title = get_window_title(hwnd);
 
         if let Some(pos) = self.windows.iter().position(|&w| w == hwnd) {
-            // Already in group -> remove and restore pre-grouped position
             self.windows.remove(pos);
+            self.last_iconic.remove(&hwnd);
             if let Some(orig) = self.original_rects.remove(&hwnd) {
+                self.mark_sync_cooldown();
                 unsafe {
                     if IsZoomed(hwnd) != 0 || IsIconic(hwnd) != 0 {
-                        restore_window(hwnd);
+                        restore_window_force(hwnd);
                     }
                     SetWindowPos(
                         hwnd,
@@ -246,8 +357,8 @@ impl GroupManager {
             }
             self.print_group_status();
             self.retile();
+            self.update_tray_tooltip();
         } else {
-            // Not in group -> save original rect and add to group
             let mut rect: RECT = unsafe { zeroed() };
             if unsafe { GetWindowRect(hwnd, &mut rect) } != 0 {
                 self.original_rects.insert(hwnd, rect);
@@ -259,6 +370,7 @@ impl GroupManager {
             }
 
             self.windows.push(hwnd);
+            self.last_iconic.insert(hwnd, false);
             match self.lang {
                 Lang::Zh => println!(
                     "➕ 已加入窗口组: [{}] (当前组内共 {} 个窗口)",
@@ -273,10 +385,11 @@ impl GroupManager {
             }
             self.print_group_status();
             self.retile();
+            self.update_tray_tooltip();
         }
     }
 
-    /// Minimize or restore the entire group at once
+    /// Minimize or restore the entire group at once via hotkey or tray menu
     fn toggle_minimize_group(&mut self) {
         self.prune_closed_windows();
         if self.windows.is_empty() {
@@ -287,6 +400,8 @@ impl GroupManager {
             return;
         }
 
+        self.mark_sync_cooldown();
+
         let all_minimized = self
             .windows
             .iter()
@@ -295,7 +410,7 @@ impl GroupManager {
         if all_minimized {
             for &hwnd in &self.windows {
                 unsafe {
-                    restore_window(hwnd);
+                    restore_window_force(hwnd);
                 }
             }
             self.retile();
@@ -304,9 +419,13 @@ impl GroupManager {
                     SetForegroundWindow(last_hwnd);
                 }
             }
+            self.sync_iconic_snapshot();
             match self.lang {
                 Lang::Zh => println!("🔼 已一键还原整个窗口组 ({} 个窗口)", self.windows.len()),
-                Lang::En => println!("🔼 Restored entire window group ({} window(s))", self.windows.len()),
+                Lang::En => println!(
+                    "🔼 Restored entire window group ({} window(s))",
+                    self.windows.len()
+                ),
             }
         } else {
             for &hwnd in &self.windows {
@@ -314,11 +433,124 @@ impl GroupManager {
                     ShowWindow(hwnd, SW_MINIMIZE);
                 }
             }
+            self.sync_iconic_snapshot();
+            self.last_fg_in_group = false;
             match self.lang {
                 Lang::Zh => println!("🔽 已一键最小化整个窗口组 ({} 个窗口)", self.windows.len()),
-                Lang::En => println!("🔽 Minimized entire window group ({} window(s))", self.windows.len()),
+                Lang::En => println!(
+                    "🔽 Minimized entire window group ({} window(s))",
+                    self.windows.len()
+                ),
             }
         }
+    }
+
+    /// Periodic ground-truth state check (runs every 150ms & on WinEvents):
+    /// 1. If any grouped window transitioned from Minimized -> Open, restore & retile the entire group!
+    /// 2. If any grouped window transitioned from Open -> Minimized, minimize the entire group!
+    /// 3. If foreground focus switched from an outside window to a grouped window, bring the entire group to front!
+    fn check_window_states(&mut self) {
+        if self.prune_closed_windows() && !self.windows.is_empty() {
+            self.retile();
+            return;
+        }
+
+        if self.windows.len() <= 1 || self.is_in_sync_cooldown() {
+            return;
+        }
+
+        // 1. Check for Iconic (Minimize / Restore) state transitions
+        let mut newly_restored: Option<HWND> = None;
+        let mut newly_minimized: Option<HWND> = None;
+
+        for &hwnd in &self.windows {
+            let now_iconic = unsafe { IsIconic(hwnd) != 0 };
+            let was_iconic = self.last_iconic.get(&hwnd).copied().unwrap_or(false);
+
+            if was_iconic && !now_iconic {
+                newly_restored = Some(hwnd);
+                break;
+            } else if !was_iconic && now_iconic {
+                newly_minimized = Some(hwnd);
+                break;
+            }
+        }
+
+        if let Some(trigger_hwnd) = newly_restored {
+            self.mark_sync_cooldown();
+            for &hwnd in &self.windows {
+                if hwnd != trigger_hwnd {
+                    unsafe {
+                        if IsIconic(hwnd) != 0 {
+                            restore_window_force(hwnd);
+                        }
+                    }
+                }
+            }
+            self.retile_Keeping_focus(trigger_hwnd);
+            self.sync_iconic_snapshot();
+            match self.lang {
+                Lang::Zh => println!(
+                    "🔗 检测到组内窗口 [{}] 唤醒，已联动还原并平铺整组 ({} 个窗口)",
+                    get_window_title(trigger_hwnd),
+                    self.windows.len()
+                ),
+                Lang::En => println!(
+                    "🔗 [{}] restored -> linked-restored & tiled entire group ({} windows)",
+                    get_window_title(trigger_hwnd),
+                    self.windows.len()
+                ),
+            }
+            return;
+        }
+
+        if let Some(trigger_hwnd) = newly_minimized {
+            self.mark_sync_cooldown();
+            for &hwnd in &self.windows {
+                if hwnd != trigger_hwnd {
+                    unsafe {
+                        if IsIconic(hwnd) == 0 {
+                            ShowWindowAsync(hwnd, SW_MINIMIZE);
+                            ShowWindow(hwnd, SW_MINIMIZE);
+                        }
+                    }
+                }
+            }
+            self.sync_iconic_snapshot();
+            self.last_fg_in_group = false;
+            match self.lang {
+                Lang::Zh => println!(
+                    "🔗 检测到组内窗口 [{}] 最小化，已联动最小化整组 ({} 个窗口)",
+                    get_window_title(trigger_hwnd),
+                    self.windows.len()
+                ),
+                Lang::En => println!(
+                    "🔗 [{}] minimized -> linked-minimized entire group ({} windows)",
+                    get_window_title(trigger_hwnd),
+                    self.windows.len()
+                ),
+            }
+            return;
+        }
+
+        // 2. Check if user clicked into a grouped window from an outside window (or while another member is minimized)
+        let fg = unsafe { GetForegroundWindow() };
+        let now_fg_in_group = !fg.is_null() && self.windows.contains(&fg);
+
+        if now_fg_in_group && unsafe { IsIconic(fg) == 0 } {
+            let any_other_minimized = self
+                .windows
+                .iter()
+                .any(|&w| w != fg && unsafe { IsIconic(w) != 0 });
+
+            if !self.last_fg_in_group || any_other_minimized {
+                self.mark_sync_cooldown();
+                self.retile_Keeping_focus(fg);
+                self.sync_iconic_snapshot();
+            }
+        }
+
+        self.last_fg_in_group = now_fg_in_group;
     }
 
     /// Cycle through tiling regions and immediately re-tile
@@ -335,22 +567,32 @@ impl GroupManager {
     fn clear_group(&mut self) {
         self.windows.clear();
         self.original_rects.clear();
+        self.last_iconic.clear();
+        self.last_fg_in_group = false;
         self.target_monitor = None;
+        self.update_tray_tooltip();
         match self.lang {
             Lang::Zh => println!("🧹 已清空窗口组，所有窗口恢复自由状态。"),
             Lang::En => println!("🧹 Cleared window group. All windows are now unmanaged."),
         }
     }
 
-    /// Dynamically divide target region and tile all grouped windows
     fn retile(&mut self) {
+        let fg = unsafe { GetForegroundWindow() };
+        self.retile_Keeping_focus(fg);
+    }
+
+    /// Dynamically divide target region, restore any minimized members, and bring all grouped windows to front
+    #[allow(non_snake_case)]
+    fn retile_Keeping_focus(&mut self, preferred_fg: HWND) {
         self.prune_closed_windows();
         let n = self.windows.len();
         if n == 0 {
             return;
         }
 
-        let fg_hwnd = unsafe { GetForegroundWindow() };
+        self.mark_sync_cooldown();
+
         let work_area = self.get_target_work_area();
         let bounds = self.region.apply(work_area);
         let target_rects = calculate_grid_layout(bounds, n);
@@ -358,17 +600,20 @@ impl GroupManager {
         for (&hwnd, target) in self.windows.iter().zip(target_rects.iter()) {
             unsafe {
                 if IsIconic(hwnd) != 0 || IsZoomed(hwnd) != 0 {
-                    restore_window(hwnd);
+                    restore_window_force(hwnd);
                 }
                 set_window_pos_compensated(hwnd, *target);
             }
         }
 
-        if !fg_hwnd.is_null() && self.windows.contains(&fg_hwnd) {
+        if !preferred_fg.is_null() && self.windows.contains(&preferred_fg) {
             unsafe {
-                SetForegroundWindow(fg_hwnd);
+                keybd_event(0, 0, KEYEVENTF_KEYUP, 0);
+                SetForegroundWindow(preferred_fg);
             }
         }
+
+        self.sync_iconic_snapshot();
     }
 
     /// Get work area of the target monitor (excluding taskbar)
@@ -416,9 +661,30 @@ impl GroupManager {
     }
 }
 
-/// Reliably restore a minimized or maximized window (compatible with Windows Terminal ConPTY/XAML)
-unsafe fn restore_window(hwnd: HWND) {
+/// Reliably restore a minimized or maximized window even when called from a background timer/hook
+unsafe fn restore_window_force(hwnd: HWND) {
+    // Unlock Windows ForegroundLockTimeout using dummy keyup + AttachThreadInput
+    keybd_event(0, 0, KEYEVENTF_KEYUP, 0);
+
+    let fg = GetForegroundWindow();
+    let cur_tid = GetCurrentThreadId();
+    let fg_tid = if !fg.is_null() {
+        GetWindowThreadProcessId(fg, null_mut())
+    } else {
+        0
+    };
+    let target_tid = GetWindowThreadProcessId(hwnd, null_mut());
+
+    if fg_tid != 0 && fg_tid != cur_tid {
+        AttachThreadInput(cur_tid, fg_tid, 1);
+    }
+    if target_tid != 0 && target_tid != cur_tid {
+        AttachThreadInput(cur_tid, target_tid, 1);
+    }
+
+    ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     ShowWindow(hwnd, SW_RESTORE);
+
     if IsIconic(hwnd) != 0 {
         SendMessageTimeoutW(
             hwnd,
@@ -430,14 +696,16 @@ unsafe fn restore_window(hwnd: HWND) {
             null_mut(),
         );
     }
+
+    if target_tid != 0 && target_tid != cur_tid {
+        AttachThreadInput(cur_tid, target_tid, 0);
+    }
+    if fg_tid != 0 && fg_tid != cur_tid {
+        AttachThreadInput(cur_tid, fg_tid, 0);
+    }
 }
 
-/// Calculate grid layout rectangles for `n` windows inside `bounds`:
-/// - n = 1: Full region (1x1)
-/// - n = 2: Side-by-side split (1x2)
-/// - n = 3: Three equal columns (1x3)
-/// - n = 4: 2x2 grid
-/// - n >= 5: M rows x K columns even grid
+/// Calculate grid layout rectangles for `n` windows inside `bounds`
 fn calculate_grid_layout(bounds: RECT, n: usize) -> Vec<RECT> {
     if n == 0 {
         return Vec::new();
@@ -476,11 +744,12 @@ fn calculate_grid_layout(bounds: RECT, n: usize) -> Vec<RECT> {
     rects
 }
 
-/// Compensate for Windows 10/11 DWM invisible borders (~7px) for seamless zero-gap tiling
+/// Compensate for Windows 10/11 DWM invisible borders (~7px) and bring window to front of Z-order
 unsafe fn set_window_pos_compensated(hwnd: HWND, target: RECT) {
+    // Use TOPMOST -> NOTOPMOST promotion so non-active grouped windows are guaranteed to rise above covering windows
     SetWindowPos(
         hwnd,
-        HWND_TOP,
+        HWND_TOPMOST,
         target.left,
         target.top,
         target.right - target.left,
@@ -512,12 +781,22 @@ unsafe fn set_window_pos_compensated(hwnd: HWND, target: RECT) {
 
         SetWindowPos(
             hwnd,
-            HWND_TOP,
+            HWND_NOTOPMOST,
             adj_left,
             adj_top,
             adj_width,
             adj_height,
             SWP_NOACTIVATE,
+        );
+    } else {
+        SetWindowPos(
+            hwnd,
+            HWND_NOTOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
         );
     }
 }
@@ -556,11 +835,23 @@ fn get_window_title(hwnd: HWND) -> String {
     }
 }
 
+fn to_wide_null(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+fn copy_wide_str(dest: &mut [u16], src: &str) {
+    let encoded: Vec<u16> = src.encode_utf16().collect();
+    let max_len = dest.len().saturating_sub(1);
+    let copy_len = encoded.len().min(max_len);
+    dest[..copy_len].copy_from_slice(&encoded[..copy_len]);
+    dest[copy_len] = 0;
+}
+
 thread_local! {
     static MANAGER: RefCell<GroupManager> = RefCell::new(GroupManager::new(Lang::detect()));
 }
 
-/// Listen for system window destruction events to auto-retile remaining grouped windows
+/// Listen for system window events and trigger immediate state check
 unsafe extern "system" fn win_event_proc(
     _hook: HWINEVENTHOOK,
     event: u32,
@@ -570,33 +861,224 @@ unsafe extern "system" fn win_event_proc(
     _id_event_thread: u32,
     _dwms_event_time: u32,
 ) {
-    if event == EVENT_OBJECT_DESTROY && id_object == OBJID_WINDOW && id_child == 0 && !hwnd.is_null()
-    {
-        // Ensure the window is truly closed and not merely minimized (e.g. XAML/UIA teardown on minimize)
-        let really_closed =
-            IsWindow(hwnd) == 0 || (IsWindowVisible(hwnd) == 0 && IsIconic(hwnd) == 0);
-        if !really_closed {
-            return;
+    if id_object != OBJID_WINDOW || id_child != 0 || hwnd.is_null() {
+        return;
+    }
+
+    match event {
+        EVENT_OBJECT_DESTROY => {
+            let really_closed =
+                IsWindow(hwnd) == 0 || (IsWindowVisible(hwnd) == 0 && IsIconic(hwnd) == 0);
+            if !really_closed {
+                return;
+            }
+
+            MANAGER.with(|mgr| {
+                let mut mgr = mgr.borrow_mut();
+                if let Some(pos) = mgr.windows.iter().position(|&w| w == hwnd) {
+                    mgr.windows.remove(pos);
+                    mgr.original_rects.remove(&hwnd);
+                    mgr.last_iconic.remove(&hwnd);
+                    match mgr.lang {
+                        Lang::Zh => println!(
+                            "🔄 检测到组内窗口关闭，自动重排剩余 {} 个窗口",
+                            mgr.windows.len()
+                        ),
+                        Lang::En => println!(
+                            "🔄 Grouped window closed; auto-retiling {} remaining window(s)",
+                            mgr.windows.len()
+                        ),
+                    }
+                    mgr.retile();
+                    mgr.update_tray_tooltip();
+                }
+            });
+        }
+        EVENT_SYSTEM_MINIMIZESTART | EVENT_SYSTEM_MINIMIZEEND | EVENT_SYSTEM_FOREGROUND => {
+            MANAGER.with(|mgr| mgr.borrow_mut().check_window_states());
+        }
+        _ => {}
+    }
+}
+
+/// Show native right-click context menu for the System Tray icon
+unsafe fn show_tray_context_menu(hwnd: HWND) {
+    let (lang, count, has_console) = MANAGER.with(|m| {
+        let mgr = m.borrow();
+        (mgr.lang, mgr.windows.len(), mgr.console_allocated)
+    });
+
+    let hmenu = CreatePopupMenu();
+    if hmenu.is_null() {
+        return;
+    }
+
+    let (txt_retile, txt_hide, txt_region, txt_clear, txt_console, txt_lang, txt_quit) = match lang {
+        Lang::Zh => (
+            format!("🔄 重新平铺当前组 ({} 个窗口)\tAlt+T", count),
+            "🔽 隐藏 / 还原整个窗口组\tAlt+H".to_string(),
+            "📐 切换平铺区域\tAlt+S".to_string(),
+            "🧹 清空窗口组\tAlt+C".to_string(),
+            if has_console {
+                "🖥️ 隐藏日志终端窗口".to_string()
+            } else {
+                "🖥️ 显示日志终端窗口".to_string()
+            },
+            "🌐 切换语言 (中文 / EN)\tAlt+L".to_string(),
+            "❌ 退出 TileGroup\tAlt+Q".to_string(),
+        ),
+        Lang::En => (
+            format!("🔄 Re-tile Group ({} windows)\tAlt+T", count),
+            "🔽 Hide / Restore Group\tAlt+H".to_string(),
+            "📐 Switch Tiling Region\tAlt+S".to_string(),
+            "🧹 Clear Window Group\tAlt+C".to_string(),
+            if has_console {
+                "🖥️ Hide Log Console".to_string()
+            } else {
+                "🖥️ Show Log Console".to_string()
+            },
+            "🌐 Switch Language (EN / 中文)\tAlt+L".to_string(),
+            "❌ Quit TileGroup\tAlt+Q".to_string(),
+        ),
+    };
+
+    AppendMenuW(hmenu, MF_STRING, CMD_RETILE, to_wide_null(&txt_retile).as_ptr());
+    AppendMenuW(hmenu, MF_STRING, CMD_MIN_RESTORE, to_wide_null(&txt_hide).as_ptr());
+    AppendMenuW(hmenu, MF_STRING, CMD_CYCLE_REGION, to_wide_null(&txt_region).as_ptr());
+    AppendMenuW(hmenu, MF_STRING, CMD_CLEAR_GROUP, to_wide_null(&txt_clear).as_ptr());
+    AppendMenuW(hmenu, MF_SEPARATOR, 0, null_mut());
+    AppendMenuW(hmenu, MF_STRING, CMD_TOGGLE_CONSOLE, to_wide_null(&txt_console).as_ptr());
+    AppendMenuW(hmenu, MF_STRING, CMD_TOGGLE_LANG, to_wide_null(&txt_lang).as_ptr());
+    AppendMenuW(hmenu, MF_SEPARATOR, 0, null_mut());
+    AppendMenuW(hmenu, MF_STRING, CMD_QUIT, to_wide_null(&txt_quit).as_ptr());
+
+    let mut pt: POINT = zeroed();
+    GetCursorPos(&mut pt);
+    SetForegroundWindow(hwnd);
+    TrackPopupMenu(
+        hmenu,
+        TPM_LEFTALIGN | TPM_BOTTOMALIGN | TPM_RIGHTBUTTON,
+        pt.x,
+        pt.y,
+        0,
+        hwnd,
+        null_mut(),
+    );
+    DestroyMenu(hmenu);
+}
+
+/// Hidden window procedure handling Tray Icon events, Menu Commands, and Polling Timer
+unsafe extern "system" fn tray_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_TRAYICON => {
+            let event = (lparam & 0xFFFF) as u32;
+            if event == WM_RBUTTONUP {
+                show_tray_context_menu(hwnd);
+            } else if event == WM_LBUTTONDBLCLK {
+                MANAGER.with(|m| m.borrow_mut().toggle_minimize_group());
+            }
+            0
+        }
+        WM_COMMAND => {
+            let cmd = wparam & 0xFFFF;
+            match cmd {
+                CMD_RETILE => MANAGER.with(|m| m.borrow_mut().retile()),
+                CMD_MIN_RESTORE => MANAGER.with(|m| m.borrow_mut().toggle_minimize_group()),
+                CMD_CYCLE_REGION => MANAGER.with(|m| m.borrow_mut().cycle_region()),
+                CMD_CLEAR_GROUP => MANAGER.with(|m| m.borrow_mut().clear_group()),
+                CMD_TOGGLE_CONSOLE => MANAGER.with(|m| m.borrow_mut().toggle_console()),
+                CMD_TOGGLE_LANG => MANAGER.with(|m| m.borrow_mut().toggle_language()),
+                CMD_QUIT => PostQuitMessage(0),
+                _ => {}
+            }
+            0
+        }
+        WM_TIMER => {
+            if wparam == TIMER_STATE_POLL {
+                MANAGER.with(|m| m.borrow_mut().check_window_states());
+            }
+            0
+        }
+        WM_DESTROY => {
+            PostQuitMessage(0);
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+unsafe fn create_tray_window_and_icon(lang: Lang) -> HWND {
+    let class_name = to_wide_null("TileGroupTrayClass");
+    let hinstance = GetModuleHandleW(null_mut());
+
+    let mut wc: WNDCLASSW = zeroed();
+    wc.lpfnWndProc = Some(tray_wnd_proc);
+    wc.hInstance = hinstance;
+    wc.lpszClassName = class_name.as_ptr();
+    RegisterClassW(&wc);
+
+    let hwnd = CreateWindowExW(
+        0,
+        class_name.as_ptr(),
+        to_wide_null("TileGroup").as_ptr(),
+        WS_OVERLAPPEDWINDOW,
+        0,
+        0,
+        0,
+        0,
+        null_mut(),
+        null_mut(),
+        hinstance,
+        null_mut(),
+    );
+
+    if !hwnd.is_null() {
+        let mut nid: NOTIFYICONDATAW = zeroed();
+        nid.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+        nid.hWnd = hwnd;
+        nid.uID = TRAY_ICON_ID;
+        nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_INFO;
+        nid.uCallbackMessage = WM_TRAYICON;
+        nid.hIcon = LoadIconW(null_mut(), IDI_APPLICATION);
+        nid.dwInfoFlags = NIIF_INFO;
+
+        match lang {
+            Lang::Zh => {
+                copy_wide_str(&mut nid.szTip, "TileGroup - 轻量级窗口组平铺工具 (右键菜单)");
+                copy_wide_str(&mut nid.szInfoTitle, "TileGroup 已在后台运行");
+                copy_wide_str(
+                    &mut nid.szInfo,
+                    "Alt+G: 加入/移出窗口组 | Alt+H: 隐藏/还原整组 | 右键托盘图标查看更多",
+                );
+            }
+            Lang::En => {
+                copy_wide_str(&mut nid.szTip, "TileGroup - Window Group Tiler (Right-click)");
+                copy_wide_str(&mut nid.szInfoTitle, "TileGroup is running in System Tray");
+                copy_wide_str(
+                    &mut nid.szInfo,
+                    "Alt+G: Add/Remove Window | Alt+H: Hide/Restore Group | Right-click tray icon",
+                );
+            }
         }
 
-        MANAGER.with(|mgr| {
-            let mut mgr = mgr.borrow_mut();
-            if let Some(pos) = mgr.windows.iter().position(|&w| w == hwnd) {
-                mgr.windows.remove(pos);
-                mgr.original_rects.remove(&hwnd);
-                match mgr.lang {
-                    Lang::Zh => println!(
-                        "🔄 检测到组内窗口关闭，自动重排剩余 {} 个窗口",
-                        mgr.windows.len()
-                    ),
-                    Lang::En => println!(
-                        "🔄 Grouped window closed; auto-retiling {} remaining window(s)",
-                        mgr.windows.len()
-                    ),
-                }
-                mgr.retile();
-            }
-        });
+        Shell_NotifyIconW(NIM_ADD, &nid);
+    }
+
+    hwnd
+}
+
+unsafe fn remove_tray_icon(hwnd: HWND) {
+    if !hwnd.is_null() {
+        let mut nid: NOTIFYICONDATAW = zeroed();
+        nid.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
+        nid.hWnd = hwnd;
+        nid.uID = TRAY_ICON_ID;
+        Shell_NotifyIconW(NIM_DELETE, &nid);
     }
 }
 
@@ -661,7 +1143,7 @@ fn print_banner(lang: Lang) {
     match lang {
         Lang::Zh => {
             println!("==============================================================");
-            println!(" 🪟 TileGroup v0.1.2 - 轻量级按需窗口组平铺工具 (Rust)");
+            println!(" 🪟 TileGroup v0.2.0 - 轻量级按需窗口组平铺工具 (系统托盘版)");
             println!("==============================================================");
             println!(" 快捷键说明：");
             println!("   [Alt + G]  将当前激活窗口 加入 / 移出 窗口组（自动均分平铺）");
@@ -672,12 +1154,12 @@ fn print_banner(lang: Lang) {
             println!("   [Alt + L]  切换界面语言 (中文 / English)");
             println!("   [Alt + Q]  退出 TileGroup");
             println!("--------------------------------------------------------------");
-            println!(" 💡 提示：组外窗口完全不受影响；关闭组内窗口会自动重排剩余窗口。");
+            println!(" 💡 提示：程序常驻右下角系统托盘；点击组内任意窗口会自动将整组置前唤醒！");
             println!("==============================================================\n");
         }
         Lang::En => {
             println!("==============================================================");
-            println!(" 🪟 TileGroup v0.1.2 - Opt-in Window Group Tiler for Windows");
+            println!(" 🪟 TileGroup v0.2.0 - Opt-in Window Group Tiler (System Tray)");
             println!("==============================================================");
             println!(" Hotkeys:");
             println!("   [Alt + G]  Add / Remove active window to/from group & auto-tile");
@@ -688,27 +1170,41 @@ fn print_banner(lang: Lang) {
             println!("   [Alt + L]  Switch UI language (English / 中文)");
             println!("   [Alt + Q]  Quit TileGroup");
             println!("--------------------------------------------------------------");
-            println!(" 💡 Tip: Non-grouped windows are untouched; closing a grouped");
-            println!("         window automatically re-tiles the remaining ones.");
+            println!(" 💡 Tip: Running in System Tray. Clicking any grouped window");
+            println!("         automatically wakes up and brings the whole group forward!");
             println!("==============================================================\n");
         }
     }
 }
 
 fn main() {
-    // 1. Enable Per-Monitor V2 DPI Awareness
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
-    // 2. Disable Console QuickEdit Mode to prevent accidental terminal freeze on mouse click
-    disable_console_quick_edit();
 
+    // Optional `--console` flag if user wants the log console open at startup
+    let want_console = env::args().any(|a| a == "--console" || a == "-c");
     let lang = MANAGER.with(|m| m.borrow().lang);
-    print_banner(lang);
+
+    if want_console {
+        MANAGER.with(|m| m.borrow_mut().toggle_console());
+    }
+
     register_hotkeys(lang);
 
-    // Register window destroy hook to auto-retile when a grouped window is closed
-    let hook = unsafe {
+    let msg_hwnd = unsafe { create_tray_window_and_icon(lang) };
+    MANAGER.with(|m| m.borrow_mut().msg_hwnd = msg_hwnd);
+
+    // Start a 150ms polling timer on the hidden tray window to reliably track Iconic & Foreground transitions
+    if !msg_hwnd.is_null() {
+        unsafe {
+            SetTimer(msg_hwnd, TIMER_STATE_POLL, 150, None);
+        }
+    }
+
+    let flags = WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS;
+
+    let hook_destroy = unsafe {
         SetWinEventHook(
             EVENT_OBJECT_DESTROY,
             EVENT_OBJECT_DESTROY,
@@ -716,7 +1212,31 @@ fn main() {
             Some(win_event_proc),
             0,
             0,
-            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+            flags,
+        )
+    };
+
+    let hook_minmax = unsafe {
+        SetWinEventHook(
+            EVENT_SYSTEM_MINIMIZESTART,
+            EVENT_SYSTEM_MINIMIZEEND,
+            null_mut(),
+            Some(win_event_proc),
+            0,
+            0,
+            flags,
+        )
+    };
+
+    let hook_fg = unsafe {
+        SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_FOREGROUND,
+            null_mut(),
+            Some(win_event_proc),
+            0,
+            0,
+            flags,
         )
     };
 
@@ -742,10 +1262,6 @@ fn main() {
                     HK_CLEAR_GROUP => MANAGER.with(|m| m.borrow_mut().clear_group()),
                     HK_TOGGLE_LANG => MANAGER.with(|m| m.borrow_mut().toggle_language()),
                     HK_QUIT => {
-                        MANAGER.with(|m| match m.borrow().lang {
-                            Lang::Zh => println!("👋 正在退出 TileGroup..."),
-                            Lang::En => println!("👋 Exiting TileGroup..."),
-                        });
                         PostQuitMessage(0);
                     }
                     _ => {}
@@ -755,8 +1271,19 @@ fn main() {
             DispatchMessageW(&msg);
         }
 
-        if !hook.is_null() {
-            UnhookWinEvent(hook);
+        if !msg_hwnd.is_null() {
+            KillTimer(msg_hwnd, TIMER_STATE_POLL);
+            remove_tray_icon(msg_hwnd);
+            DestroyWindow(msg_hwnd);
+        }
+        if !hook_fg.is_null() {
+            UnhookWinEvent(hook_fg);
+        }
+        if !hook_minmax.is_null() {
+            UnhookWinEvent(hook_minmax);
+        }
+        if !hook_destroy.is_null() {
+            UnhookWinEvent(hook_destroy);
         }
     }
 
@@ -776,25 +1303,21 @@ mod tests {
             bottom: 800,
         };
 
-        // N = 1: Full region
         let r1 = calculate_grid_layout(bounds, 1);
         assert_eq!(r1.len(), 1);
         assert_eq!((r1[0].left, r1[0].top, r1[0].right, r1[0].bottom), (0, 0, 1200, 800));
 
-        // N = 2: 1x2 split
         let r2 = calculate_grid_layout(bounds, 2);
         assert_eq!(r2.len(), 2);
         assert_eq!((r2[0].left, r2[0].right), (0, 600));
         assert_eq!((r2[1].left, r2[1].right), (600, 1200));
 
-        // N = 3: 1x3 columns
         let r3 = calculate_grid_layout(bounds, 3);
         assert_eq!(r3.len(), 3);
         assert_eq!((r3[0].left, r3[0].right), (0, 400));
         assert_eq!((r3[1].left, r3[1].right), (400, 800));
         assert_eq!((r3[2].left, r3[2].right), (800, 1200));
 
-        // N = 4: 2x2 grid
         let r4 = calculate_grid_layout(bounds, 4);
         assert_eq!(r4.len(), 4);
         assert_eq!((r4[0].left, r4[0].top, r4[0].right, r4[0].bottom), (0, 0, 600, 400));

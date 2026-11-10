@@ -15,10 +15,13 @@ Unlike full-screen tiling window managers (such as GlazeWM or Komorebi) that hij
   - `3` windows: Three equal columns (`1×3`)
   - `4` windows: `2×2` grid
   - `5+` windows: Automatic `M×N` grid layout
-- **Auto Re-tile on Window Close**: If you close a grouped window, the remaining windows in the group automatically re-tile to fill the space.
-- **Auto Restore on Removal**: Removing a window from the group automatically restores it to its original pre-grouped size and position.
-- **One-Key Group Minimize / Restore**: Minimize the entire window group at once, or bring the whole group back to the front together.
-- **Pixel-Perfect & Ultra-Lightweight**: Built in pure Rust using `windows-sys` with Per-Monitor V2 DPI awareness and Windows 10/11 DWM invisible border compensation. Standalone `.exe` is only **~130 KB** with **~2 MB** RAM usage.
+- **Synchronized Group Behavior (Linked Minimize, Restore & Focus)**:
+  - Clicking **any** grouped window (on screen or on the taskbar) automatically wakes up and brings **all** windows in the group to the front together.
+  - Minimizing any grouped window automatically minimizes the entire group together.
+  - Closing any grouped window automatically re-tiles the remaining windows to fill the space.
+  - Removing a window from the group (`Alt + G`) automatically restores its original pre-grouped size and position.
+- **Silent System Tray App**: Runs quietly in the Windows System Tray with zero taskbar clutter. Right-click the tray icon to switch regions, clear the group, toggle the debug log console, switch languages (`EN` / `ZH`), or quit.
+- **Pixel-Perfect & Ultra-Lightweight**: Built in pure Rust using `windows-sys` with Per-Monitor V2 DPI awareness and Windows 10/11 DWM invisible border compensation. Standalone `.exe` is only **~156 KB** with **~2 MB** RAM usage.
 
 ---
 
@@ -27,7 +30,7 @@ Unlike full-screen tiling window managers (such as GlazeWM or Komorebi) that hij
 | Hotkey | Action |
 | :--- | :--- |
 | **`Alt + G`** | **Add / Remove** the active foreground window to/from the group and auto-tile (restores original window size on removal) |
-| **`Alt + H`** | **Hide (Minimize) / Restore** the entire window group at once |
+| **`Alt + H`** | **Hide (Minimize) / Restore** the entire window group at once (or double-click the system tray icon) |
 | **`Alt + S`** | **Switch Tiling Region** (`Full WorkArea` → `Left Half` → `Right Half` → `Top Half` → `Bottom Half`) and re-tile |
 | **`Alt + T`** | **Re-tile** the current group manually (snap back if dragged out of place) |
 | **`Alt + C`** | **Clear** the window group (ungroup all windows) |
@@ -38,10 +41,10 @@ Unlike full-screen tiling window managers (such as GlazeWM or Komorebi) that hij
 
 ## 🚀 Usage & CLI Options
 
-Run directly or pass `--en` / `--zh` to force the interface language (auto-detected from your Windows UI language by default):
+Double-click `tile-group.exe` (or `tile-group-en.exe`) to run silently in the Windows System Tray:
 
 ```powershell
-# Auto-detect language from Windows locale
+# Auto-detect language from Windows locale (runs in System Tray)
 tile-group.exe
 
 # Force English UI
@@ -49,6 +52,9 @@ tile-group.exe --en
 
 # Force Chinese UI
 tile-group.exe --zh
+
+# Open with the log console visible at startup
+tile-group.exe --console
 ```
 
 ---
