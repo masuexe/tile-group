@@ -1,5 +1,7 @@
 # TileGroup 🪟
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 [English](README.md) | [简体中文](README_zh.md)
 
 **A lightweight, non-intrusive, opt-in window group tiler for Windows.**

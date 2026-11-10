@@ -1,5 +1,7 @@
 # TileGroup 🪟
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 [English](README.md) | [简体中文](README_zh.md)
 
 **轻量级、非侵入式的 Windows 按需窗口编组平铺工具**
