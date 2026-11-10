@@ -24,6 +24,7 @@ use windows_sys::Win32::UI::HiDpi::{
 };
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     keybd_event, RegisterHotKey, UnregisterHotKey, KEYEVENTF_KEYUP, MOD_ALT, MOD_NOREPEAT,
+    VK_OEM_4, VK_OEM_6,
 };
 use windows_sys::Win32::UI::Shell::{
     Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE,
@@ -37,13 +38,13 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     PostQuitMessage, RegisterClassW, SendMessageTimeoutW, SetForegroundWindow, SetTimer,
     SetWindowPos, ShowWindow, ShowWindowAsync, TrackPopupMenu, TranslateMessage,
     EVENT_OBJECT_DESTROY, EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_MINIMIZEEND,
-    EVENT_SYSTEM_MINIMIZESTART, GWL_EXSTYLE, GWL_STYLE, HWND_NOTOPMOST, HWND_TOPMOST,
-    IDI_APPLICATION, MF_SEPARATOR, MF_STRING, MSG, OBJID_WINDOW, SC_RESTORE, SMTO_ABORTIFHUNG,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SW_MINIMIZE, SW_RESTORE,
-    SW_SHOWNOACTIVATE, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_RIGHTBUTTON, WINEVENT_OUTOFCONTEXT,
-    WINEVENT_SKIPOWNPROCESS, WM_COMMAND, WM_DESTROY, WM_HOTKEY, WM_LBUTTONDBLCLK, WM_RBUTTONUP,
-    WM_SYSCOMMAND, WM_TIMER, WM_USER, WNDCLASSW, WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW,
-    WS_THICKFRAME,
+    EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MOVESIZEEND, EVENT_SYSTEM_MOVESIZESTART, GWL_EXSTYLE,
+    GWL_STYLE, HWND_NOTOPMOST, HWND_TOPMOST, IDI_APPLICATION, MF_SEPARATOR, MF_STRING, MSG,
+    OBJID_WINDOW, SC_RESTORE, SMTO_ABORTIFHUNG, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SW_MINIMIZE, SW_RESTORE, SW_SHOWNOACTIVATE, TPM_BOTTOMALIGN, TPM_LEFTALIGN,
+    TPM_RIGHTBUTTON, WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WM_COMMAND, WM_DESTROY,
+    WM_HOTKEY, WM_LBUTTONDBLCLK, WM_RBUTTONUP, WM_SYSCOMMAND, WM_TIMER, WM_USER, WNDCLASSW,
+    WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW, WS_THICKFRAME,
 };
 
 #[link(name = "kernel32")]
@@ -65,11 +66,14 @@ const HK_RETILE: i32 = 4;        // Alt + T: Manually re-tile current group
 const HK_CLEAR_GROUP: i32 = 5;   // Alt + C: Clear window group
 const HK_QUIT: i32 = 6;          // Alt + Q: Quit program
 const HK_TOGGLE_LANG: i32 = 7;   // Alt + L: Switch UI language (EN / ZH)
+const HK_MOVE_PREV: i32 = 8;     // Alt + [: Move active window to previous slot
+const HK_MOVE_NEXT: i32 = 9;     // Alt + ]: Move active window to next slot
 
 // System Tray & Timer constants
 const WM_TRAYICON: u32 = WM_USER + 1;
 const TRAY_ICON_ID: u32 = 1;
 const TIMER_STATE_POLL: usize = 100;
+const TIMER_POST_SWAP: usize = 101;
 
 // Tray Menu Command IDs
 const CMD_RETILE: usize = 1001;
@@ -192,6 +196,13 @@ impl TileRegion {
     }
 }
 
+/// Tracks an active mouse move/resize operation on a grouped window
+#[derive(Clone, Copy)]
+struct DragState {
+    hwnd: HWND,
+    start_rect: RECT,
+}
+
 /// Window group state manager / 窗口组状态管理器
 struct GroupManager {
     windows: Vec<HWND>,
@@ -206,6 +217,8 @@ struct GroupManager {
     suppress_sync_until: Option<Instant>,
     console_allocated: bool,
     msg_hwnd: HWND,
+    active_drag: Option<DragState>,
+    post_swap_focus: Option<HWND>,
 }
 
 impl GroupManager {
@@ -221,6 +234,8 @@ impl GroupManager {
             suppress_sync_until: None,
             console_allocated: false,
             msg_hwnd: null_mut(),
+            active_drag: None,
+            post_swap_focus: None,
         }
     }
 
@@ -450,6 +465,11 @@ impl GroupManager {
     /// 2. If any grouped window transitioned from Open -> Minimized, minimize the entire group!
     /// 3. If foreground focus switched from an outside window to a grouped window, bring the entire group to front!
     fn check_window_states(&mut self) {
+        // Do not interfere while the user is actively dragging or resizing a grouped window
+        if self.active_drag.is_some() {
+            return;
+        }
+
         if self.prune_closed_windows() && !self.windows.is_empty() {
             self.retile();
             return;
@@ -551,6 +571,139 @@ impl GroupManager {
         }
 
         self.last_fg_in_group = now_fg_in_group;
+    }
+
+    /// Move the active grouped window backward (`delta = -1`) or forward (`delta = 1`) in the layout slots
+    fn move_active_window(&mut self, delta: isize) {
+        self.prune_closed_windows();
+        let n = self.windows.len();
+        if n <= 1 {
+            return;
+        }
+
+        let fg = unsafe { GetForegroundWindow() };
+        let Some(idx) = self.windows.iter().position(|&w| w == fg) else {
+            match self.lang {
+                Lang::Zh => println!("ℹ️ 当前激活窗口不在窗口组内，无法调整位置。"),
+                Lang::En => println!("ℹ️ Active window is not in the group."),
+            }
+            return;
+        };
+
+        let new_idx = (idx as isize + delta).rem_euclid(n as isize) as usize;
+        self.windows.swap(idx, new_idx);
+        match self.lang {
+            Lang::Zh => println!(
+                "🔀 调整窗口槽位: [{}] (#{} <-> #{})",
+                get_window_title(fg),
+                idx + 1,
+                new_idx + 1
+            ),
+            Lang::En => println!(
+                "🔀 Swapped window slot: [{}] (#{} <-> #{})",
+                get_window_title(fg),
+                idx + 1,
+                new_idx + 1
+            ),
+        }
+        self.print_group_status();
+        self.retile_Keeping_focus(fg);
+    }
+
+    /// Record initial window bounds when the user starts dragging or resizing a grouped window
+    fn on_move_size_start(&mut self, hwnd: HWND) {
+        if !self.windows.contains(&hwnd) {
+            return;
+        }
+        let mut rect: RECT = unsafe { zeroed() };
+        if unsafe { GetWindowRect(hwnd, &mut rect) } != 0 {
+            self.active_drag = Some(DragState {
+                hwnd,
+                start_rect: rect,
+            });
+        }
+    }
+
+    /// When user finishes dragging a grouped window, swap it with the target grid cell under the cursor
+    fn on_move_size_end(&mut self, hwnd: HWND) {
+        let drag = self.active_drag.take();
+        self.prune_closed_windows();
+        let n = self.windows.len();
+        if n <= 1 {
+            return;
+        }
+
+        let Some(src_idx) = self.windows.iter().position(|&w| w == hwnd) else {
+            return;
+        };
+
+        // Distinguish border/corner resize from title-bar drag:
+        // If any corner remained anchored while width/height changed, the user manually resized an edge -> keep it!
+        if let Some(d) = drag.filter(|d| d.hwnd == hwnd) {
+            let mut end_rect: RECT = unsafe { zeroed() };
+            if unsafe { GetWindowRect(hwnd, &mut end_rect) } != 0 {
+                let start_w = d.start_rect.right - d.start_rect.left;
+                let start_h = d.start_rect.bottom - d.start_rect.top;
+                let end_w = end_rect.right - end_rect.left;
+                let end_h = end_rect.bottom - end_rect.top;
+
+                let same_tl = (end_rect.left - d.start_rect.left).abs() <= 3
+                    && (end_rect.top - d.start_rect.top).abs() <= 3;
+                let same_br = (end_rect.right - d.start_rect.right).abs() <= 3
+                    && (end_rect.bottom - d.start_rect.bottom).abs() <= 3;
+                let same_bl = (end_rect.left - d.start_rect.left).abs() <= 3
+                    && (end_rect.bottom - d.start_rect.bottom).abs() <= 3;
+                let same_tr = (end_rect.right - d.start_rect.right).abs() <= 3
+                    && (end_rect.top - d.start_rect.top).abs() <= 3;
+
+                let size_changed = (end_w - start_w).abs() > 6 || (end_h - start_h).abs() > 6;
+                if (same_tl || same_br || same_bl || same_tr) && size_changed {
+                    return;
+                }
+            }
+        }
+
+        let mut cursor: POINT = unsafe { zeroed() };
+        if unsafe { GetCursorPos(&mut cursor) } == 0 {
+            return;
+        }
+
+        let work_area = self.get_target_work_area();
+        let bounds = self.region.apply(work_area);
+        let target_rects = calculate_grid_layout(bounds, n);
+
+        let dst_idx = target_rects.iter().position(|r| {
+            cursor.x >= r.left && cursor.x < r.right && cursor.y >= r.top && cursor.y < r.bottom
+        });
+
+        if let Some(dst) = dst_idx {
+            if dst != src_idx {
+                self.windows.swap(src_idx, dst);
+                match self.lang {
+                    Lang::Zh => println!(
+                        "🖱️ 拖拽对调窗口位置: #{} <-> #{} ([{}])",
+                        src_idx + 1,
+                        dst + 1,
+                        get_window_title(hwnd)
+                    ),
+                    Lang::En => println!(
+                        "🖱️ Drag-swapped slots: #{} <-> #{} ([{}])",
+                        src_idx + 1,
+                        dst + 1,
+                        get_window_title(hwnd)
+                    ),
+                }
+                self.print_group_status();
+            }
+            // Snap into target slot (and schedule a 70ms follow-up in case Windows Aero Snap triggers on screen edges)
+            self.retile_Keeping_focus(hwnd);
+            if !self.msg_hwnd.is_null() {
+                self.post_swap_focus = Some(hwnd);
+                unsafe {
+                    SetTimer(self.msg_hwnd, TIMER_POST_SWAP, 70, None);
+                }
+            }
+        }
     }
 
     /// Cycle through tiling regions and immediately re-tile
@@ -725,7 +878,13 @@ fn calculate_grid_layout(bounds: RECT, n: usize) -> Vec<RECT> {
     let extra = n % rows;
 
     for r in 0..rows {
-        let cols_in_row = if r < extra { base_cols + 1 } else { base_cols };
+        // Place larger cells (fewer columns) on the top rows, and smaller cells on the bottom rows
+        // e.g. for n = 5 (rows = 2): top row has 2 big slots, bottom row has 3 smaller slots
+        let cols_in_row = if r >= rows - extra {
+            base_cols + 1
+        } else {
+            base_cols
+        };
         let top = bounds.top + (total_h * r as i32) / rows as i32;
         let bottom = bounds.top + (total_h * (r + 1) as i32) / rows as i32;
 
@@ -897,6 +1056,12 @@ unsafe extern "system" fn win_event_proc(
         EVENT_SYSTEM_MINIMIZESTART | EVENT_SYSTEM_MINIMIZEEND | EVENT_SYSTEM_FOREGROUND => {
             MANAGER.with(|mgr| mgr.borrow_mut().check_window_states());
         }
+        EVENT_SYSTEM_MOVESIZESTART => {
+            MANAGER.with(|mgr| mgr.borrow_mut().on_move_size_start(hwnd));
+        }
+        EVENT_SYSTEM_MOVESIZEEND => {
+            MANAGER.with(|mgr| mgr.borrow_mut().on_move_size_end(hwnd));
+        }
         _ => {}
     }
 }
@@ -1001,6 +1166,16 @@ unsafe extern "system" fn tray_wnd_proc(
         WM_TIMER => {
             if wparam == TIMER_STATE_POLL {
                 MANAGER.with(|m| m.borrow_mut().check_window_states());
+            } else if wparam == TIMER_POST_SWAP {
+                KillTimer(hwnd, TIMER_POST_SWAP);
+                MANAGER.with(|m| {
+                    let mut mgr = m.borrow_mut();
+                    let focus = mgr
+                        .post_swap_focus
+                        .take()
+                        .unwrap_or_else(|| GetForegroundWindow());
+                    mgr.retile_Keeping_focus(focus);
+                });
             }
             0
         }
@@ -1107,15 +1282,17 @@ fn register_hotkeys(lang: Lang) -> bool {
         let ok_c = RegisterHotKey(null_mut(), HK_CLEAR_GROUP, mods, b'C' as u32) != 0;
         let ok_l = RegisterHotKey(null_mut(), HK_TOGGLE_LANG, mods, b'L' as u32) != 0;
         let ok_q = RegisterHotKey(null_mut(), HK_QUIT, mods, b'Q' as u32) != 0;
+        let ok_prev = RegisterHotKey(null_mut(), HK_MOVE_PREV, mods, VK_OEM_4 as u32) != 0;
+        let ok_next = RegisterHotKey(null_mut(), HK_MOVE_NEXT, mods, VK_OEM_6 as u32) != 0;
 
-        if !(ok_g && ok_h && ok_s && ok_t && ok_c && ok_l && ok_q) {
+        if !(ok_g && ok_h && ok_s && ok_t && ok_c && ok_l && ok_q && ok_prev && ok_next) {
             match lang {
                 Lang::Zh => eprintln!("⚠️ 部分快捷键注册失败（可能与其他软件冲突）:"),
                 Lang::En => eprintln!("⚠️ Failed to register some hotkeys (possible conflict):"),
             }
             eprintln!(
-                "   Alt+G: {}, Alt+H: {}, Alt+S: {}, Alt+T: {}, Alt+C: {}, Alt+L: {}, Alt+Q: {}",
-                ok_g, ok_h, ok_s, ok_t, ok_c, ok_l, ok_q
+                "   Alt+G: {}, Alt+H: {}, Alt+[: {}, Alt+]: {}, Alt+S: {}, Alt+T: {}, Alt+C: {}, Alt+L: {}, Alt+Q: {}",
+                ok_g, ok_h, ok_prev, ok_next, ok_s, ok_t, ok_c, ok_l, ok_q
             );
             return false;
         }
@@ -1133,6 +1310,8 @@ fn unregister_hotkeys() {
             HK_CLEAR_GROUP,
             HK_TOGGLE_LANG,
             HK_QUIT,
+            HK_MOVE_PREV,
+            HK_MOVE_NEXT,
         ] {
             UnregisterHotKey(null_mut(), id);
         }
@@ -1143,35 +1322,38 @@ fn print_banner(lang: Lang) {
     match lang {
         Lang::Zh => {
             println!("==============================================================");
-            println!(" 🪟 TileGroup v0.2.0 - 轻量级按需窗口组平铺工具 (系统托盘版)");
+            println!(" 🪟 TileGroup v0.3.0 - 轻量级按需窗口组平铺工具 (系统托盘版)");
             println!("==============================================================");
             println!(" 快捷键说明：");
-            println!("   [Alt + G]  将当前激活窗口 加入 / 移出 窗口组（自动均分平铺）");
-            println!("   [Alt + H]  一键 隐藏(最小化) / 还原 整个窗口组");
-            println!("   [Alt + S]  切换平铺区域（全屏 -> 左半屏 -> 右半屏 -> 上半屏 -> 下半屏）");
-            println!("   [Alt + T]  手动重新对齐平铺当前组");
-            println!("   [Alt + C]  清空窗口组（解散编组）");
-            println!("   [Alt + L]  切换界面语言 (中文 / English)");
-            println!("   [Alt + Q]  退出 TileGroup");
+            println!("   [Alt + G]      将当前激活窗口 加入 / 移出 窗口组（自动均分平铺）");
+            println!("   [Alt + [ / ]]  将当前窗口在组内 前移 / 后移 槽位（调换大小格位置）");
+            println!("   [鼠标拖拽]      按住窗口标题栏拖到目标格子松手，自动与目标窗口对调位置");
+            println!("   [Alt + H]      一键 隐藏(最小化) / 还原 整个窗口组");
+            println!("   [Alt + S]      切换平铺区域（全屏 -> 左半屏 -> 右半屏 -> 上半屏 -> 下半屏）");
+            println!("   [Alt + T]      手动重新对齐平铺当前组");
+            println!("   [Alt + C]      清空窗口组（解散编组）");
+            println!("   [Alt + L]      切换界面语言 (中文 / English)");
+            println!("   [Alt + Q]      退出 TileGroup");
             println!("--------------------------------------------------------------");
-            println!(" 💡 提示：程序常驻右下角系统托盘；点击组内任意窗口会自动将整组置前唤醒！");
+            println!(" 💡 提示：5窗口等非对称布局下，前排槽位默认占大格；支持拖拽或快捷键自由换位！");
             println!("==============================================================\n");
         }
         Lang::En => {
             println!("==============================================================");
-            println!(" 🪟 TileGroup v0.2.0 - Opt-in Window Group Tiler (System Tray)");
+            println!(" 🪟 TileGroup v0.3.0 - Opt-in Window Group Tiler (System Tray)");
             println!("==============================================================");
-            println!(" Hotkeys:");
-            println!("   [Alt + G]  Add / Remove active window to/from group & auto-tile");
-            println!("   [Alt + H]  Hide (Minimize) / Restore the entire window group");
-            println!("   [Alt + S]  Switch tiling region (Full -> Left -> Right -> Top -> Bottom)");
-            println!("   [Alt + T]  Re-tile current group manually");
-            println!("   [Alt + C]  Clear window group (ungroup all)");
-            println!("   [Alt + L]  Switch UI language (English / 中文)");
-            println!("   [Alt + Q]  Quit TileGroup");
+            println!(" Hotkeys & Mouse:");
+            println!("   [Alt + G]      Add / Remove active window to/from group & auto-tile");
+            println!("   [Alt + [ / ]]  Move active window to Previous / Next slot in group");
+            println!("   [Mouse Drag]   Drag a grouped window's title bar onto another slot to swap");
+            println!("   [Alt + H]      Hide (Minimize) / Restore the entire window group");
+            println!("   [Alt + S]      Switch tiling region (Full -> Left -> Right -> Top -> Bottom)");
+            println!("   [Alt + T]      Re-tile current group manually");
+            println!("   [Alt + C]      Clear window group (ungroup all)");
+            println!("   [Alt + L]      Switch UI language (English / 中文)");
+            println!("   [Alt + Q]      Quit TileGroup");
             println!("--------------------------------------------------------------");
-            println!(" 💡 Tip: Running in System Tray. Clicking any grouped window");
-            println!("         automatically wakes up and brings the whole group forward!");
+            println!(" 💡 Tip: Front slots get larger cells (e.g. 5 windows = 2 big top + 3 bottom).");
             println!("==============================================================\n");
         }
     }
@@ -1240,6 +1422,18 @@ fn main() {
         )
     };
 
+    let hook_movesize = unsafe {
+        SetWinEventHook(
+            EVENT_SYSTEM_MOVESIZESTART,
+            EVENT_SYSTEM_MOVESIZEEND,
+            null_mut(),
+            Some(win_event_proc),
+            0,
+            0,
+            flags,
+        )
+    };
+
     unsafe {
         let mut msg: MSG = zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
@@ -1249,6 +1443,8 @@ fn main() {
                     HK_TOGGLE_WINDOW => MANAGER.with(|m| m.borrow_mut().toggle_foreground_window()),
                     HK_MIN_RESTORE => MANAGER.with(|m| m.borrow_mut().toggle_minimize_group()),
                     HK_CYCLE_REGION => MANAGER.with(|m| m.borrow_mut().cycle_region()),
+                    HK_MOVE_PREV => MANAGER.with(|m| m.borrow_mut().move_active_window(-1)),
+                    HK_MOVE_NEXT => MANAGER.with(|m| m.borrow_mut().move_active_window(1)),
                     HK_RETILE => {
                         MANAGER.with(|m| {
                             let mut mgr = m.borrow_mut();
@@ -1273,8 +1469,12 @@ fn main() {
 
         if !msg_hwnd.is_null() {
             KillTimer(msg_hwnd, TIMER_STATE_POLL);
+            KillTimer(msg_hwnd, TIMER_POST_SWAP);
             remove_tray_icon(msg_hwnd);
             DestroyWindow(msg_hwnd);
+        }
+        if !hook_movesize.is_null() {
+            UnhookWinEvent(hook_movesize);
         }
         if !hook_fg.is_null() {
             UnhookWinEvent(hook_fg);
@@ -1324,5 +1524,14 @@ mod tests {
         assert_eq!((r4[1].left, r4[1].top, r4[1].right, r4[1].bottom), (600, 0, 1200, 400));
         assert_eq!((r4[2].left, r4[2].top, r4[2].right, r4[2].bottom), (0, 400, 600, 800));
         assert_eq!((r4[3].left, r4[3].top, r4[3].right, r4[3].bottom), (600, 400, 1200, 800));
+
+        // N = 5: Top row has 2 BIG windows (600px wide), bottom row has 3 SMALL windows (400px wide)
+        let r5 = calculate_grid_layout(bounds, 5);
+        assert_eq!(r5.len(), 5);
+        assert_eq!((r5[0].left, r5[0].top, r5[0].right, r5[0].bottom), (0, 0, 600, 400));
+        assert_eq!((r5[1].left, r5[1].top, r5[1].right, r5[1].bottom), (600, 0, 1200, 400));
+        assert_eq!((r5[2].left, r5[2].top, r5[2].right, r5[2].bottom), (0, 400, 400, 800));
+        assert_eq!((r5[3].left, r5[3].top, r5[3].right, r5[3].bottom), (400, 400, 800, 800));
+        assert_eq!((r5[4].left, r5[4].top, r5[4].right, r5[4].bottom), (800, 400, 1200, 800));
     }
 }

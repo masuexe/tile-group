@@ -14,14 +14,17 @@ Unlike full-screen tiling window managers (such as GlazeWM or Komorebi) that hij
   - `2` windows: Side-by-side split (`1×2`)
   - `3` windows: Three equal columns (`1×3`)
   - `4` windows: `2×2` grid
-  - `5+` windows: Automatic `M×N` grid layout
+  - `5+` windows: Smart `M×N` grid layout with **larger primary slots on the top row(s)** (e.g., `5` windows = `2` large slots on top + `3` smaller slots on bottom)
+- **Flexible Slot Reordering (Drag-to-Swap & Hotkeys)**:
+  - **Mouse Drag-to-Swap**: Simply drag any grouped window's title bar onto another slot and release to swap their positions and sizes automatically (manual edge/corner border resizing is preserved).
+  - **Keyboard Slot Swap**: Press `Alt + [` or `Alt + ]` to move the focused window backward or forward across group slots (for example, quickly promoting a small bottom-row window to a large top-row slot).
 - **Synchronized Group Behavior (Linked Minimize, Restore & Focus)**:
   - Clicking **any** grouped window (on screen or on the taskbar) automatically wakes up and brings **all** windows in the group to the front together.
   - Minimizing any grouped window automatically minimizes the entire group together.
   - Closing any grouped window automatically re-tiles the remaining windows to fill the space.
   - Removing a window from the group (`Alt + G`) automatically restores its original pre-grouped size and position.
 - **Silent System Tray App**: Runs quietly in the Windows System Tray with zero taskbar clutter. Right-click the tray icon to switch regions, clear the group, toggle the debug log console, switch languages (`EN` / `ZH`), or quit.
-- **Pixel-Perfect & Ultra-Lightweight**: Built in pure Rust using `windows-sys` with Per-Monitor V2 DPI awareness and Windows 10/11 DWM invisible border compensation. Standalone `.exe` is only **~156 KB** with **~2 MB** RAM usage.
+- **Pixel-Perfect & Ultra-Lightweight**: Built in pure Rust using `windows-sys` with Per-Monitor V2 DPI awareness and Windows 10/11 DWM invisible border compensation. Standalone `.exe` is only **~160 KB** with **~2 MB** RAM usage.
 
 ---
 
@@ -30,6 +33,7 @@ Unlike full-screen tiling window managers (such as GlazeWM or Komorebi) that hij
 | Hotkey | Action |
 | :--- | :--- |
 | **`Alt + G`** | **Add / Remove** the active foreground window to/from the group and auto-tile (restores original window size on removal) |
+| **`Alt + [`** / **`Alt + ]`** | **Move Active Window** to the previous / next slot in the group (swap positions & sizes) |
 | **`Alt + H`** | **Hide (Minimize) / Restore** the entire window group at once (or double-click the system tray icon) |
 | **`Alt + S`** | **Switch Tiling Region** (`Full WorkArea` → `Left Half` → `Right Half` → `Top Half` → `Bottom Half`) and re-tile |
 | **`Alt + T`** | **Re-tile** the current group manually (snap back if dragged out of place) |
