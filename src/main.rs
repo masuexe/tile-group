@@ -423,18 +423,8 @@ impl GroupManager {
             .all(|&hwnd| unsafe { IsIconic(hwnd) != 0 });
 
         if all_minimized {
-            for &hwnd in &self.windows {
-                unsafe {
-                    restore_window_force(hwnd);
-                }
-            }
-            self.retile();
-            if let Some(&last_hwnd) = self.windows.last() {
-                unsafe {
-                    SetForegroundWindow(last_hwnd);
-                }
-            }
-            self.sync_iconic_snapshot();
+            let preferred_fg = self.windows.last().copied().unwrap_or(null_mut());
+            self.bring_group_to_front(preferred_fg);
             match self.lang {
                 Lang::Zh => println!("🔼 已一键还原整个窗口组 ({} 个窗口)", self.windows.len()),
                 Lang::En => println!(
@@ -461,7 +451,7 @@ impl GroupManager {
     }
 
     /// Periodic ground-truth state check (runs every 150ms & on WinEvents):
-    /// 1. If any grouped window transitioned from Minimized -> Open, restore & retile the entire group!
+    /// 1. If any grouped window transitioned from Minimized -> Open, restore & bring the entire group to front!
     /// 2. If any grouped window transitioned from Open -> Minimized, minimize the entire group!
     /// 3. If foreground focus switched from an outside window to a grouped window, bring the entire group to front!
     fn check_window_states(&mut self) {
@@ -497,26 +487,15 @@ impl GroupManager {
         }
 
         if let Some(trigger_hwnd) = newly_restored {
-            self.mark_sync_cooldown();
-            for &hwnd in &self.windows {
-                if hwnd != trigger_hwnd {
-                    unsafe {
-                        if IsIconic(hwnd) != 0 {
-                            restore_window_force(hwnd);
-                        }
-                    }
-                }
-            }
-            self.retile_Keeping_focus(trigger_hwnd);
-            self.sync_iconic_snapshot();
+            self.bring_group_to_front(trigger_hwnd);
             match self.lang {
                 Lang::Zh => println!(
-                    "🔗 检测到组内窗口 [{}] 唤醒，已联动还原并平铺整组 ({} 个窗口)",
+                    "🔗 检测到组内窗口 [{}] 唤醒，已联动还原整组 ({} 个窗口)",
                     get_window_title(trigger_hwnd),
                     self.windows.len()
                 ),
                 Lang::En => println!(
-                    "🔗 [{}] restored -> linked-restored & tiled entire group ({} windows)",
+                    "🔗 [{}] restored -> linked-restored entire group ({} windows)",
                     get_window_title(trigger_hwnd),
                     self.windows.len()
                 ),
@@ -564,9 +543,7 @@ impl GroupManager {
                 .any(|&w| w != fg && unsafe { IsIconic(w) != 0 });
 
             if !self.last_fg_in_group || any_other_minimized {
-                self.mark_sync_cooldown();
-                self.retile_Keeping_focus(fg);
-                self.sync_iconic_snapshot();
+                self.bring_group_to_front(fg);
             }
         }
 
@@ -735,6 +712,45 @@ impl GroupManager {
         self.retile_Keeping_focus(fg);
     }
 
+    /// Restore any minimized grouped windows and bring the entire group to the front
+    /// WITHOUT changing any window's existing position or size.
+    fn bring_group_to_front(&mut self, preferred_fg: HWND) {
+        self.prune_closed_windows();
+        if self.windows.is_empty() {
+            return;
+        }
+
+        self.mark_sync_cooldown();
+
+        for &hwnd in &self.windows {
+            unsafe {
+                if IsIconic(hwnd) != 0 {
+                    restore_window_force(hwnd);
+                }
+            }
+        }
+
+        for &hwnd in &self.windows {
+            if hwnd != preferred_fg {
+                unsafe {
+                    raise_window_z_order(hwnd);
+                }
+            }
+        }
+
+        if !preferred_fg.is_null() && self.windows.contains(&preferred_fg) {
+            unsafe {
+                raise_window_z_order(preferred_fg);
+                if GetForegroundWindow() != preferred_fg {
+                    keybd_event(0, 0, KEYEVENTF_KEYUP, 0);
+                    SetForegroundWindow(preferred_fg);
+                }
+            }
+        }
+
+        self.sync_iconic_snapshot();
+    }
+
     /// Dynamically divide target region, restore any minimized members, and bring all grouped windows to front
     #[allow(non_snake_case)]
     fn retile_Keeping_focus(&mut self, preferred_fg: HWND) {
@@ -761,8 +777,11 @@ impl GroupManager {
 
         if !preferred_fg.is_null() && self.windows.contains(&preferred_fg) {
             unsafe {
-                keybd_event(0, 0, KEYEVENTF_KEYUP, 0);
-                SetForegroundWindow(preferred_fg);
+                raise_window_z_order(preferred_fg);
+                if GetForegroundWindow() != preferred_fg {
+                    keybd_event(0, 0, KEYEVENTF_KEYUP, 0);
+                    SetForegroundWindow(preferred_fg);
+                }
             }
         }
 
@@ -903,19 +922,38 @@ fn calculate_grid_layout(bounds: RECT, n: usize) -> Vec<RECT> {
     rects
 }
 
-/// Compensate for Windows 10/11 DWM invisible borders (~7px) and bring window to front of Z-order
-unsafe fn set_window_pos_compensated(hwnd: HWND, target: RECT) {
-    // Use TOPMOST -> NOTOPMOST promotion so non-active grouped windows are guaranteed to rise above covering windows
+/// Promote window to top of normal Z-order without changing its position, size, or activation
+unsafe fn raise_window_z_order(hwnd: HWND) {
     SetWindowPos(
         hwnd,
         HWND_TOPMOST,
-        target.left,
-        target.top,
-        target.right - target.left,
-        target.bottom - target.top,
-        SWP_NOACTIVATE,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
     );
+    SetWindowPos(
+        hwnd,
+        HWND_NOTOPMOST,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+    );
+}
 
+fn rect_approx_eq(a: RECT, b: RECT, tol: i32) -> bool {
+    (a.left - b.left).abs() <= tol
+        && (a.top - b.top).abs() <= tol
+        && (a.right - b.right).abs() <= tol
+        && (a.bottom - b.bottom).abs() <= tol
+}
+
+/// Compensate for Windows 10/11 DWM invisible borders (~7px) and bring window to front of Z-order.
+/// Skips moving/resizing altogether if the window's visible bounds already match `target`.
+unsafe fn set_window_pos_compensated(hwnd: HWND, target: RECT) {
     let mut win_rect: RECT = zeroed();
     let mut frame_rect: RECT = zeroed();
 
@@ -927,37 +965,89 @@ unsafe fn set_window_pos_compensated(hwnd: HWND, target: RECT) {
         size_of::<RECT>() as u32,
     ) == S_OK;
 
-    if got_win && got_frame {
+    // 1. Fast path: if visible bounds already match `target` (within 1px), only promote Z-order!
+    if got_frame && rect_approx_eq(frame_rect, target, 1) {
+        raise_window_z_order(hwnd);
+        return;
+    }
+
+    // 2. Compute compensated bounds in one shot using current DWM invisible border margins
+    let (init_left, init_top, init_w, init_h) = if got_win && got_frame {
         let left_margin = (frame_rect.left - win_rect.left).clamp(0, 40);
         let top_margin = (frame_rect.top - win_rect.top).clamp(0, 40);
         let right_margin = (win_rect.right - frame_rect.right).clamp(0, 40);
         let bottom_margin = (win_rect.bottom - frame_rect.bottom).clamp(0, 40);
+        (
+            target.left - left_margin,
+            target.top - top_margin,
+            (target.right - target.left) + left_margin + right_margin,
+            (target.bottom - target.top) + top_margin + bottom_margin,
+        )
+    } else {
+        (
+            target.left,
+            target.top,
+            target.right - target.left,
+            target.bottom - target.top,
+        )
+    };
+
+    // Use TOPMOST -> NOTOPMOST promotion so non-active grouped windows rise above covering windows
+    SetWindowPos(
+        hwnd,
+        HWND_TOPMOST,
+        init_left,
+        init_top,
+        init_w,
+        init_h,
+        SWP_NOACTIVATE,
+    );
+
+    // 3. Verify post-move bounds (handles cross-monitor DPI changes); otherwise drop TOPMOST without resizing again
+    let mut post_win: RECT = zeroed();
+    let mut post_frame: RECT = zeroed();
+    let got_post_win = GetWindowRect(hwnd, &mut post_win) != 0;
+    let got_post_frame = DwmGetWindowAttribute(
+        hwnd,
+        DWMWA_EXTENDED_FRAME_BOUNDS as u32,
+        &mut post_frame as *mut _ as *mut _,
+        size_of::<RECT>() as u32,
+    ) == S_OK;
+
+    if got_post_win && got_post_frame && !rect_approx_eq(post_frame, target, 1) {
+        let left_margin = (post_frame.left - post_win.left).clamp(0, 40);
+        let top_margin = (post_frame.top - post_win.top).clamp(0, 40);
+        let right_margin = (post_win.right - post_frame.right).clamp(0, 40);
+        let bottom_margin = (post_win.bottom - post_frame.bottom).clamp(0, 40);
 
         let adj_left = target.left - left_margin;
         let adj_top = target.top - top_margin;
         let adj_width = (target.right - target.left) + left_margin + right_margin;
         let adj_height = (target.bottom - target.top) + top_margin + bottom_margin;
 
-        SetWindowPos(
-            hwnd,
-            HWND_NOTOPMOST,
-            adj_left,
-            adj_top,
-            adj_width,
-            adj_height,
-            SWP_NOACTIVATE,
-        );
-    } else {
-        SetWindowPos(
-            hwnd,
-            HWND_NOTOPMOST,
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        );
+        if (adj_left, adj_top, adj_width, adj_height) != (init_left, init_top, init_w, init_h) {
+            SetWindowPos(
+                hwnd,
+                HWND_NOTOPMOST,
+                adj_left,
+                adj_top,
+                adj_width,
+                adj_height,
+                SWP_NOACTIVATE,
+            );
+            return;
+        }
     }
+
+    SetWindowPos(
+        hwnd,
+        HWND_NOTOPMOST,
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+    );
 }
 
 /// Check if a window is a normal, resizable top-level application window
@@ -1322,7 +1412,7 @@ fn print_banner(lang: Lang) {
     match lang {
         Lang::Zh => {
             println!("==============================================================");
-            println!(" 🪟 TileGroup v0.3.0 - 轻量级按需窗口组平铺工具 (系统托盘版)");
+            println!(" 🪟 TileGroup v0.3.1 - 轻量级按需窗口组平铺工具 (系统托盘版)");
             println!("==============================================================");
             println!(" 快捷键说明：");
             println!("   [Alt + G]      将当前激活窗口 加入 / 移出 窗口组（自动均分平铺）");
@@ -1340,7 +1430,7 @@ fn print_banner(lang: Lang) {
         }
         Lang::En => {
             println!("==============================================================");
-            println!(" 🪟 TileGroup v0.3.0 - Opt-in Window Group Tiler (System Tray)");
+            println!(" 🪟 TileGroup v0.3.1 - Opt-in Window Group Tiler (System Tray)");
             println!("==============================================================");
             println!(" Hotkeys & Mouse:");
             println!("   [Alt + G]      Add / Remove active window to/from group & auto-tile");
